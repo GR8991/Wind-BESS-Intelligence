@@ -2,47 +2,61 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+
 def detect_interval_minutes(data: pd.DataFrame) -> float:
-    ts = pd.to_datetime(data["timestamp"]).sort_values()
+    ts = pd.to_datetime(data["timestamp"], errors="coerce", utc=True).dropna().sort_values()
     diffs = ts.diff().dropna().dt.total_seconds().div(60)
     diffs = diffs[diffs > 0]
-    if diffs.empty:
-        return float("nan")
-    # Median is robust to occasional missing intervals; report irregularity separately.
-    return float(diffs.median())
+    return float(diffs.median()) if not diffs.empty else float("nan")
 
-def validate_wind_data(data: pd.DataFrame, rated_wind_mw: float) -> dict:
+
+def validate_wind_data(data: pd.DataFrame, rated_wind_mw: float, interval_minutes: float | None = None) -> dict:
     errors, warnings, notes = [], [], []
     if data.empty:
-        errors.append("No valid rows remain after timestamp/power parsing.")
-        return {"errors": errors, "warnings": warnings, "notes": notes, "interval_minutes": float("nan")}
+        errors.append("No valid rows remain after timestamp parsing.")
+        return {"errors": errors, "warnings": warnings, "notes": notes, "interval_minutes": float("nan"), "safe_to_size": False}
+    if "timestamp" not in data or "active_power_mw" not in data:
+        errors.append("Normalized dataset must include timestamp and active_power_mw.")
+        return {"errors": errors, "warnings": warnings, "notes": notes, "interval_minutes": float("nan"), "safe_to_size": False}
     if data["timestamp"].duplicated().any():
-        warnings.append("Duplicate timestamps remain; review before engineering use.")
+        errors.append("Duplicate timestamps detected. Resolve duplicates before sizing; they are not silently removed.")
     if not data["timestamp"].is_monotonic_increasing:
-        warnings.append("Timestamps are not in ascending order.")
+        errors.append("Timestamps are not in ascending order.")
     if data["active_power_mw"].isna().any():
-        warnings.append("Active-power data contain missing values.")
+        errors.append("Active power contains missing or non-numeric values.")
     if (data["active_power_mw"] < -1e-6).any():
-        warnings.append("Negative active power exists. Confirm whether this is valid net export/auxiliary consumption.")
+        warnings.append("Negative active power exists. Confirm whether values represent net export or auxiliary consumption.")
     if rated_wind_mw <= 0:
         errors.append("Rated wind capacity must be greater than zero.")
-    if (data["active_power_mw"] > rated_wind_mw * 1.05).any():
-        warnings.append("Power exceeds 105% of stated rated capacity; check units and rating.")
-    interval = detect_interval_minutes(data)
-    if not np.isfinite(interval):
-        errors.append("Unable to infer a positive time interval.")
+    if rated_wind_mw > 0 and (data["active_power_mw"] > rated_wind_mw * 1.05).any():
+        errors.append("Active power exceeds 105% of stated wind-farm rating. Check column mapping, units, and rating; sizing has been blocked.")
+    interval = interval_minutes if interval_minutes and interval_minutes > 0 else detect_interval_minutes(data)
+    if not np.isfinite(interval) or interval <= 0:
+        errors.append("Unable to infer a positive sampling interval.")
     else:
-        diffs = data["timestamp"].diff().dropna().dt.total_seconds().div(60)
+        ts = pd.to_datetime(data["timestamp"], utc=True)
+        diffs = ts.diff().dropna().dt.total_seconds().div(60)
         irregular = (diffs - interval).abs() > max(interval * 0.05, 1e-6)
         if irregular.any():
-            warnings.append(f"Time intervals are irregular: {int(irregular.sum())} intervals differ from the median. Missing intervals are not automatically imputed.")
+            warnings.append(f"Irregular intervals detected: {int(irregular.sum())} differences depart from median interval {interval:g} minutes. No interpolation has been applied.")
         else:
-            notes.append("Timestamps appear regularly spaced.")
-        if interval > 60:
-            warnings.append("Detected interval is longer than one hour. Ramp analysis may not capture sub-hour events.")
-    if data["wind_speed_mps"].notna().sum() == 0:
-        warnings.append("No usable wind-speed observations were found; wind-speed-based diagnostics will be limited.")
+            notes.append(f"Regular sampling detected at approximately {interval:g} minutes.")
+    if "wind_speed_mps" in data and data["wind_speed_mps"].notna().any():
+        valid_speed = data["wind_speed_mps"].dropna()
+        if (valid_speed < 0).any() or (valid_speed.quantile(0.99) > 60):
+            warnings.append("Wind-speed values are outside the expected screening range; confirm unit and sensor data.")
     else:
-        if (data["wind_speed_mps"] < 0).any():
-            warnings.append("Negative wind-speed values exist; review units and data quality.")
-    return {"errors": errors, "warnings": warnings, "notes": notes, "interval_minutes": interval}
+        warnings.append("No normalized wind-speed observations are available. Power-only analysis may proceed if other quality gates pass.")
+    if len(data) < 8:
+        warnings.append("Very few records are available; statistical characterization may be unreliable.")
+    safe_to_size = len(errors) == 0
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "notes": notes,
+        "interval_minutes": interval,
+        "safe_to_size": safe_to_size,
+        "record_count": int(len(data)),
+        "start_utc": str(data["timestamp"].min()),
+        "end_utc": str(data["timestamp"].max()),
+    }
